@@ -1,0 +1,21 @@
+* text=auto eol=lf
+
+# Scripts must stay LF: a CRLF-converted heredoc or shebang fails on any
+# non-Windows machine with a misleading error.
+*.sh    text eol=lf
+Makefile text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.md    text eol=lf
+
+# Keys and certs are already excluded by .gitignore, but pin the line ending
+# so an accidental add cannot corrupt them.
+*.key   text eol=lf
+*.pem   text eol=lf
+
+# Archives and images are binary: never line-ending rewritten.
+*.tgz   binary
+*.tar.gz binary
+*.png   binary
+*.jpg   binary
+*.svg   text eol=lf

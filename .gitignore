@@ -1,0 +1,48 @@
+# ---- secrets: NEVER commit these -------------------------------------------
+# The handoff file produced by monitoring-server-setup.sh. It contains the
+# Grafana admin password and the proxy public key. Mode 600, machine-local.
+client-bundle.env
+*.bundle.env
+
+# The server writes this into ~/docker/monitoring with a random Grafana admin
+# password. Same reason.
+.env
+.env.*
+!.env.example
+
+# ---- keys: never commit private key material -------------------------------
+*.key
+*.pem
+id_rsa*
+id_ed25519*
+id_ecdsa*
+*.pub          # public keys are fine, but we generate them at install time
+known_hosts
+authorized_keys
+
+# ---- backups and scratch ---------------------------------------------------
+*.bak
+*.bak.*
+*.tgz
+*.tar.gz
+*.orig
+*.rej
+*~
+
+# ---- runtime output ---------------------------------------------------------
+*.log
+*.out
+backups/
+*.db
+*.db-*
+
+# ---- OS / editor cruft -----------------------------------------------------
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# ---- never commit .git itself (obviously, but state it) --------------------
+.git/
