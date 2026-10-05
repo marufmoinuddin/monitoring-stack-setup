@@ -39,6 +39,7 @@ PROXY_PORT="${PROXY_PORT:-8080}"
 PROM_PORT="${PROM_PORT:-9090}"
 GRAFANA_PORT="${GRAFANA_PORT:-3000}"
 EXPORT_PORT="${EXPORT_PORT:-9100}"
+ADMIN_PORT="${ADMIN_PORT:-8099}"
 RETENTION_TIME="${RETENTION_TIME:-90d}"
 RETENTION_SIZE="${RETENTION_SIZE:-20GB}"
 CONF_DIR="${CONF_DIR:-/etc/http-over-ssh}"
@@ -996,6 +997,21 @@ if [ "$DRY_RUN" -eq 0 ]; then
   echo
   c_note "ports actually listening:"
   ss -lntp 2>/dev/null | grep -E ":($PROXY_PORT|$PROM_PORT|$GRAFANA_PORT|$EXPORT_PORT)\b" | sed 's/^/       /' || c_note "(none yet)"
+fi
+
+c_step "Admin panel (optional)"
+# The panel is a separate binary so a Grafana-only install never needs Go.
+if have monitoring-admin || systemctl list-unit-files 2>/dev/null | grep -q '^monitoring-admin'; then
+  c_ok "monitoring-admin present"
+  sh_run "systemctl enable --now monitoring-admin"
+  c_note "installer served at http://127.0.0.1:${ADMIN_PORT}/install.sh"
+  c_note "create a client in the panel to get the one-line install command"
+else
+  c_note "panel not installed. To add it:"
+  c_note "  git clone https://github.com/marufmoinuddin/monitoring-stack-setup.git"
+  c_note "  cd monitoring-stack-setup && make install"
+  c_note "  sudo install -m 644 monitoring-admin.service /etc/systemd/system/"
+  c_note "  sudo systemctl enable --now monitoring-admin"
 fi
 
 # =============================================================== bundle ======

@@ -46,3 +46,5 @@ Thumbs.db
 
 # ---- never commit .git itself (obviously, but state it) --------------------
 .git/
+# ---- built artifact (rebuild with `make build`) --------------------------
+/monitoring-admin

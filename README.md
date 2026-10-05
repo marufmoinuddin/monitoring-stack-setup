@@ -4,46 +4,49 @@
 > NAT — from one Grafana dashboard, **without opening a single inbound port and
 > without WireGuard or any VPN.**
 
-Built as a replacement for Netdata Cloud: the same single-pane-of-glass view,
-but your data never leaves your own server and no third party holds your host
-keys.
+Built as a replacement for Netdata Cloud, and modelled on how
+[Beszel](https://github.com/henrygd/beszel) makes installation a single
+copy-paste.
 
-## Two ways to deploy
+## The one-liner
 
-Both are fully supported. Pick whichever fits the machine.
+```bash
+curl -fsSL https://monitor.example.com/install.sh -o /tmp/install-monitoring.sh \
+  && chmod +x /tmp/install-monitoring.sh \
+  && sudo /tmp/install-monitoring.sh --name my-laptop --port 2201 \
+       --server monitor.example.com --key "ssh-ed25519 AAAA..."
+```
 
-| | Docker Compose | Native systemd |
-|---|---|---|
-| **Server script** | `monitoring-server-setup.sh` | `monitoring-server-setup-native.sh` |
-| Needs Docker | yes | **no** |
-| Needs Go toolchain | yes (builds the proxy) | no (prebuilt binary) |
-| Config lives in | `~/docker/monitoring/` | `/etc/prometheus`, `/etc/http-over-ssh/` |
-| Services | 3 containers | 4 systemd units |
-| Web server | optional nginx | optional nginx |
-| Best for | VPSes already running containers | a plain server, a VPS you don't want to put containers on, Arch/Fedora boxes |
+You do not assemble that by hand. The admin panel mints it: enter a device
+name, click **Generate install command**, copy it, run it on the client. The
+panel then prints the one server-side command needed to authorise the key.
 
-The **client script is the same for both** — a client never needs to know how
-the server is deployed.
+```
+   admin panel (monitor-admin.example.com)
+        |  enter a name -> mints keypair + one-liner + server steps
+        v
+   client: paste one-liner  ──►  node_exporter on 127.0.0.1
+                                 autossh reverse tunnel out to the server
+   server: paste 1 command   ──►  authorises the client's key
+                                 pins its host key when the tunnel appears
+```
 
 ## Why this instead of the usual options
 
-Most "monitor everything" tools want you to expose an endpoint to the internet
-or join a SaaS. Both have costs:
-
-- **Exposing a metrics port** hands an attacker a permanent, richly detailed
-  readout of your kernel, disk layout and service inventory — and scanners find
-  `/metrics` within minutes of a port appearing.
+- **Exposing a metrics port** hands an attacker a permanent, detailed readout of
+  your kernel, disk layout and service inventory — scanners find `/metrics`
+  within minutes of a port appearing.
 - **A hosted service** sees every machine's metadata and requires you to trust a
-  third party that can be breached.
+  third party.
 
-This inverts it. Every client dials **out** to your server and holds an SSH
-reverse tunnel open. Nothing listens on the internet except nginx on 80/443.
+This inverts it. Every client dials **out** and holds an SSH reverse tunnel
+open. Nothing listens on the internet except nginx on 80/443.
 
 ```
      your browser
           │  HTTPS (or an SSH tunnel — your choice)
           ▼
-       nginx  ─── or ───  nothing at all, Grafana on loopback
+       nginx ─── or ─── nothing at all, Grafana on loopback
           │
           ▼
    Grafana  ──────────────┐
@@ -59,216 +62,200 @@ reverse tunnel open. Nothing listens on the internet except nginx on 80/443.
               client: sshd:22 ──► node_exporter (127.0.0.1:9100)
 ```
 
-The proxy SSHes *into* the tunnel, authenticates to the client, and fetches the
-exporter. The client's exporter is bound to loopback, so even someone on the
-same Wi-Fi cannot read it.
+## Components
 
-## Requirements
-
-### Server
-
-**Either** deployment needs: Linux with **systemd**, root/sudo, `curl`,
-`ssh-keyscan`, and enough free disk for your retention window.
-
-- **Docker mode** additionally needs Docker + Docker Compose.
-- **Native mode** needs no container runtime at all. `prometheus` and
-  `node_exporter` come from your distro; Grafana comes from Grafana's official
-  package repository, which the script adds for you.
-
-**A web server is optional.** By default the script uses nginx if it finds one
-and writes a vhost. Pass `--web none` and it will not touch your web server at
-all — Grafana then listens only on loopback and you reach it through an SSH
-tunnel. Nothing is exposed to the internet in that mode.
-
-If you *do* want nginx publishing, you need a hostname pointing at the server.
-A TLS certificate is optional: with none found, the script writes a plain-HTTP
-vhost and tells you.
-
-### Client
-
-Linux with systemd, `autossh`, `node_exporter`, and root/sudo. Nothing needs to
-be reachable from the internet. No Docker, no VPN, no inbound firewall rule.
+| Path | What it is |
+|---|---|
+| `install.sh` | The client installer. POSIX `sh`, ~420 lines, prints every step. |
+| `admin/` | The admin panel. Standard-library-only Go, no dependencies. |
+| `monitoring-admin.service` | systemd unit for the panel. |
+| `monitoring-server-setup.sh` | Server setup, Docker Compose mode. |
+| `monitoring-server-setup-native.sh` | Server setup, native systemd mode. |
+| `monitoring-client-setup.sh` | Bundle-based client setup (the older path). |
+| `Makefile` | `make build` / `make check` / `make install` for the panel. |
+| `docs/BESZEL-RESEARCH.md` | What we took from Beszel, and what we deliberately did not. |
 
 ## Quick start
 
-### Docker mode
+### 1. The server
+
+Pick one:
 
 ```bash
-git clone https://github.com/marufmoinuddin/monitoring-stack-setup.git
-cd monitoring-stack-setup
-
-# 1. On the SERVER — dry-run first, it changes nothing
+# Docker Compose
 sudo ./monitoring-server-setup.sh --dry-run
-sudo ./monitoring-server-setup.sh              # add --web none to skip nginx
+sudo ./monitoring-server-setup.sh                 # add --web none to skip nginx
 
-# 2. Copy the bundle and client script to your client
-scp ~/docker/monitoring/client-bundle.env ./monitoring-client-setup.sh <client>:
-
-# 3. On the CLIENT
-chmod +x monitoring-client-setup.sh
-./monitoring-client-setup.sh --bundle client-bundle.env --dry-run
-./monitoring-client-setup.sh --bundle client-bundle.env --name my-laptop
-
-# 4. Back on the SERVER — authorizes the key, waits for the tunnel,
-#    pins the client's host key, restarts the proxy
-sudo ./monitoring-server-setup.sh --add-client-key "ssh-ed25519 AAAA... my-laptop"
-```
-
-### Native mode
-
-Identical, different script:
-
-```bash
+# Native systemd — no Docker, no Go toolchain needed
 sudo ./monitoring-server-setup-native.sh --dry-run
-sudo ./monitoring-server-setup-native.sh --web none     # or without --web for nginx
-
-# bundle lands at /etc/http-over-ssh/client-bundle.env
-scp /etc/http-over-ssh/client-bundle.env ./monitoring-client-setup.sh <client>:
+sudo ./monitoring-server-setup-native.sh
 ```
 
-### Then
+Both create the tunnel network/user, the sshd drop-in, per-port firewall rules,
+Prometheus, Grafana, the proxy, and the client bundle. Add `--web none` and they
+touch no web server at all — Grafana stays on loopback and you reach it with
+`ssh -L 3000:127.0.0.1:3000 <server>`.
 
-Open Grafana, import dashboard **1860** (Node Exporter Full), pick Prometheus,
-and choose your device in the instance dropdown.
-
-Without a web server, forward the port instead:
+### 2. The admin panel
 
 ```bash
-ssh -L 3000:127.0.0.1:3000 <server>     # then browse http://127.0.0.1:3000
+make check          # vet + build + a live 9-assertion smoke test
+sudo make install   # /usr/local/bin/monitoring-admin
+sudo install -m 644 monitoring-admin.service /etc/systemd/system/
+sudo useradd -r -s /usr/sbin/nologin monitoring-admin
+sudo install -d -o monitoring-admin -g monitoring-admin /var/lib/monitoring-admin
+sudo install -d -m 700 /etc/monitoring
+sudo tee /etc/monitoring/admin.env >/dev/null <<EOF
+MON_LISTEN=127.0.0.1:8099
+MON_DOMAIN=monitor.example.com
+MON_TUNNEL_HOST=127.0.0.1
+MON_PROMETHEUS_URL=http://127.0.0.1:9090
+MON_PROXY_PUBKEY=$(cat /path/to/proxy/id_ed25519.pub)
+MON_REPO_DIR=$(pwd)
+EOF
+sudo chmod 600 /etc/monitoring/admin.env
+sudo systemctl enable --now monitoring-admin
 ```
 
-## The handoff file
+Publish it through nginx on its own subdomain, or simply forward the port with
+`ssh -L 8099:127.0.0.1:8099 <server>` — the panel is an internal tool and needs
+no public URL.
 
-The server writes `client-bundle.env` (mode 600) containing the server address,
-its SSH host key fingerprint, the tunnel port, the proxy public key, and the
-Grafana URL with credentials. The client script consumes exactly that file.
+### 3. Add a client
 
-It is **parsed, never sourced** — values contain spaces and a bundle that
-arrived over the network must not be able to execute code. The server's host
-key is checked against the fingerprint in the bundle, and a mismatch aborts
-without writing anything.
+In the panel: enter a device name → **Generate install command** → copy it →
+paste the "authorise the key" step onto the server. The client appears in the
+device table as soon as its tunnel is up.
 
-## Options
+## The client installer
 
-All three scripts accept `--dry-run`, `--yes`, and `--help`.
+`install.sh` is deliberately **plain POSIX shell you can read before running**.
+Nothing is downloaded except distro packages; no code is fetched from the
+network at install time.
 
-Server scripts:
+It:
 
-| Flag | Effect |
-|---|---|
-| `--web nginx` | Publish through nginx (default when one is found) |
-| `--web none` | No web server; Grafana on loopback, reach it via SSH tunnel |
-| `--add-client-key "<key>"` | Phase 2: authorize a client, wait for its tunnel, pin its host key |
-| `--rollback` | Undo everything (metrics data is kept) |
+1. Refuses unknown platforms and non-systemd hosts with an actionable message.
+2. Installs `node_exporter` via a package-manager ladder
+   (apk → apt → dnf → yum → pacman → zypper).
+3. **Binds the exporter to `127.0.0.1`** and verifies the bind address. This is
+   the single most important step: a wildcard bind would publish your disk
+   layout and service inventory to the whole LAN.
+4. Creates `promssh`, a metrics-only account that can forward to
+   `localhost:9100` and nothing else. Shell-less, password-locked.
+5. Generates a tunnel key **as the invoking user** and pins the server host key.
+6. Installs an `autossh` unit that survives sleep, reboots and Wi-Fi changes.
+7. Verifies its own work and tells you what happens next.
 
-Docker server only: `--subnet`, `--domain`, `--grafana-host`, `--project`.
-
-Native server only: `--domain`, `--grafana-host`, `--tunnel-host` (defaults to
-`127.0.0.1`, so tunnels are loopback-only unless you widen it deliberately).
-
-Client:
-
-| Flag | Effect |
-|---|---|
-| `--bundle <file>` | The server bundle (auto-found in common paths if omitted) |
-| `--name <name>` | Device label, used in the key comment and dashboards |
-| `--no-unit` | Skip the autossh systemd unit |
-
-## Adding more devices
-
-One port, one key, one line per device. Ports `2201`-`2203` are pre-authorised.
-
-```bash
-./monitoring-client-setup.sh --bundle client-bundle.env --name pi
-sudo ./monitoring-server-setup.sh --add-client-key "ssh-ed25519 AAAA... pi-to-monitoring-server"
+```
+--name <name>       device label (required)
+--port <n>          tunnel port on the server (required)
+--server <host>     monitoring server hostname (required)
+--key "<pubkey>"    server proxy public key (required)
+--user <name>       tunnel account on the server (default: monitor)
+--dry-run           print what would happen, change nothing
+--skip-packages     do not touch the package manager
+--uninstall         remove everything this script installed
 ```
 
-Then add the target to `prometheus.yml` and restart **the server's** Prometheus.
-Use `--force-recreate`, not `kill -s HUP` — see trap 2.
-
-For a fourth device, extend `PermitListen` in the sshd drop-in and add another
-firewall rule.
-
-## How the security model holds
+## Security model
 
 | Boundary | Control |
 |---|---|
 | Internet | Only nginx 80/443 is public. No compose service has a `ports:` section. |
 | Tunnel ports | Bound to loopback (native) or the private bridge address (Docker). Never public. |
-| `monitor` account | Key-only, `nologin`, reverse forwarding only, limited to three ports. |
-| `promssh` account | May only forward to `localhost:9100`. No shell, no other ports. |
-| `node_exporter` on clients | Bound to `127.0.0.1`, so not even the local LAN can read it. |
-| Host keys | Fingerprint-pinned in both directions; mismatches abort. |
-| Revocation | Delete one line of `authorized_keys`. |
+| `monitor` / `testmon` | Key-only, `nologin`, reverse forwarding only, limited to specific ports by `PermitListen`. |
+| `promssh` | May only forward to `localhost:9100`. No shell, locked account. |
+| `node_exporter` | Bound to `127.0.0.1`, so not even the local LAN can read it. |
+| Host keys | Fingerprint-pinned in both directions; mismatches abort without writing. |
+| Keys | The panel generates them; the private half never leaves the server. |
+| Revocation | Delete one line of `authorized_keys`, or click revoke in the panel. |
+
+## Deployment modes
+
+| | Docker Compose | Native systemd |
+|---|---|---|
+| Needs Docker | yes | **no** |
+| Needs Go | yes (builds the proxy) | no (prebuilt binary, checksum-verified) |
+| Config in | `~/docker/monitoring/` | `/etc/prometheus`, `/etc/http-over-ssh/` |
+| Web server | optional | optional |
+
+The client installer is identical either way — a client never needs to know how
+the server is deployed.
+
+## Adding more devices
+
+The panel allocates ports from `2201`–`2203` and refuses to over-allocate. For a
+fourth device, extend `PermitListen` in the sshd drop-in, add a firewall rule,
+and raise `MON_LAST_PORT`.
 
 ## Troubleshooting
 
-The proxy log narrows a fault precisely:
+The proxy log names the fault:
 
 | Message | Meaning | Fix |
 |---|---|---|
-| `no SSH keys found` | key path wrong | check `HOS_KEY_DIR` and the `./ssh` mount (Docker) or `/etc/http-over-ssh` (native) |
-| `open .../known_hosts: no such file` | proxy exited at startup | the file is mandatory — add a client |
+| `no SSH keys found` | key path wrong | check `HOS_KEY_DIR` |
+| `open .../known_hosts: no such file` | proxy exited at startup | the file is mandatory |
 | `connection refused` | no client tunnel yet | start the client's autossh service |
-| `knownhosts: key is unknown` | no entry for that endpoint | run `--add-client-key` |
+| `knownhosts: key is unknown` | no entry for that endpoint | authorise the client |
 | `knownhosts: key mismatch` | not all host key types pinned | see trap 3 |
-| `unable to authenticate` | host keys fine, `promssh` key missing | re-run the client script |
+| `unable to authenticate` | host keys fine, `promssh` key missing | re-run the installer |
 | `SSH connection ... established` | success | — |
 
-Verify a working install:
-
 ```bash
-# Docker
+# Docker server
 cd ~/docker/monitoring && docker compose ps
 docker compose exec prometheus wget -qO- 'http://localhost:9090/api/v1/query?query=up'
+docker compose logs --tail=20 http-over-ssh
 
-# Native
-systemctl status http-over-ssh prometheus grafana-server
-curl -s http://127.0.0.1:9090/api/v1/query?query=up
+# Native server
+systemctl status http-over-ssh prometheus grafana-server monitoring-admin
+journalctl -u http-over-ssh -n 20
 ```
 
 ## Traps this encodes
 
-Each was hit for real while building this, and each is handled in the scripts:
+Each was hit for real while building this:
 
 1. **UFW port ranges silently create no kernel rule.** `ufw allow ... port
-   2201:2203 proto tcp` prints `Rule added` *and* stays listed in `ufw status`,
-   but if the multiport extension is missing, `iptables-save` has nothing and
-   traffic is blocked anyway. Both scripts add ports individually.
+   2201:2203` prints `Rule added` *and* stays listed in `ufw status`, but if the
+   multiport extension is missing `iptables-save` has nothing and traffic is
+   blocked anyway. Always add ports individually and verify against the kernel.
 2. **`kill -s HUP` reloads a stale bind-mounted file.** In Docker mode, editing
-   `prometheus.yml`, the rules, or `ssh/known_hosts` needs
+   `prometheus.yml`, the rules or `ssh/known_hosts` needs
    `docker compose up -d --force-recreate <svc>`.
 3. **`knownhosts` rejects any unlisted key for a host it already knows.** A host
    offering rsa + ecdsa + ed25519 needs all three pinned, or you get
    `key is unknown` then `key mismatch`.
 4. **`http-over-ssh` has no key-file flag.** It reads keys *and* `known_hosts`
-   from `$HOS_KEY_DIR` and exits if `known_hosts` is absent, so
-   `HOS_KEY_DIR=/ssh` is mandatory in Docker and `HOS_KEY_DIR=/etc/http-over-ssh`
-   in native mode.
+   from `$HOS_KEY_DIR` and exits if `known_hosts` is absent.
 5. **`/boot/efi` reports ~100% full.** The `LowDisk` alert excludes `vfat`.
-6. **A 600-owned file read as non-root returns empty.** The scripts use `sudo`
-   for those reads and verify the merge kept every other device's entry.
-7. **A "secure" cookie over plain HTTP breaks login.** In `--web none` mode the
-   scripts set `cookie_secure = false`; otherwise the login loop never completes.
+6. **A 600-owned file read as non-root returns empty.** Scripts use `sudo` for
+   those reads and verify the merge kept every other device's entry.
+7. **A "secure" cookie over plain HTTP breaks login.** `--web none` sets
+   `cookie_secure = false`.
+8. **`sudo $VAR=x cmd` is a parse error.** `DEBIAN_FRONTEND=noninteractive sudo
+   apt-get …` is right; `sudo DEBIAN_FRONTEND=… apt-get` is not. Hit this on a
+   real Debian VM.
+9. **`sudo` resets `$HOME` to `/root`.** The installer resolves the invoking
+   user via `SUDO_USER` so the tunnel unit references the right key path and
+   runs as the right account. Without this the unit silently cannot authenticate.
+10. **`curl -f` aborts on the 4xx you are asserting.** Use plain `curl -sS` for
+    negative tests, or the assertion passes for the wrong reason.
 
-## Dashboards and alerts
+## Verified end to end
 
-Dashboard **1860** (Node Exporter Full) is the recommended starting point. The
-provisioned alert rules are `DeviceDown`, `ProxyDown`, `HighMemory`, `LowDisk`
-and `HighCPU`. Prometheus cannot send notifications by itself — add a
-Grafana-managed contact point if you want alerts delivered.
+The one-liner path was tested on a real Debian 12 VM (libvirt/KVM), not just
+linted:
 
-## Security notes for contributors
-
-- `client-bundle.env` and `.env` hold live credentials and are git-ignored. If
-  you ever commit one, **rotate the Grafana password immediately** — assume it
-  is public.
-- Never hardcode a password, token, or private key. Generate secrets at install
-  time, as both server scripts do.
-- Keep the subnet, ports, and paths configurable via flags or environment
-  variables rather than editing them into the scripts.
-- Prefer `--web none` if you do not need a public dashboard URL. It is strictly
-  the safer default.
+- installer runs clean on a fresh VM, exporter bound to `127.0.0.1:9100`
+- `promssh` created, locked, `permitopen` restricted
+- tunnel key owned by the invoking user, not root
+- autossh unit active, tunnel listener present on the server
+- **the real `http-over-ssh` proxy scraped the VM through the tunnel** and
+  returned `nodename="mon-test"`, `Debian 6.1.187-1` — proving the whole chain
+- panel minted the command, authorized the key, and the scrape succeeded
 
 ## License
 

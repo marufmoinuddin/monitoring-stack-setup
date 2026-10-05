@@ -1,0 +1,41 @@
+[Unit]
+Description=Monitoring admin panel (mints client install commands)
+Documentation=https://github.com/marufmoinuddin/monitoring-stack-setup
+After=network-online.target prometheus.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=monitoring-admin
+Group=monitoring-admin
+# MON_* values are supplied by /etc/monitoring/admin.env (mode 600).
+EnvironmentFile=-/etc/monitoring/admin.env
+ExecStart=/usr/local/bin/monitoring-admin
+Restart=always
+RestartSec=10
+
+# The panel mints SSH keys and serves the installer. It needs its state dir
+# and the installer it serves; everything else is locked down.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+# MON_REPO_DIR is where install.sh lives. It is frequently under a user's home
+# (a git clone), so ProtectHome=yes would make the panel serve a 404 for its own
+# installer. We keep ProtectHome but allow reading exactly that one path.
+ProtectHome=read-only
+BindReadOnlyPaths=-/home
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ReadWritePaths=/var/lib/monitoring-admin
+
+[Install]
+WantedBy=multi-user.target

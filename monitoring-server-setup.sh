@@ -26,7 +26,7 @@ GATEWAY="172.30.0.1"
 NET_NAME="monitoring_net"
 PROXY_NET="proxy_net"
 TUNNEL_PORTS=(2201 2202 2203)
-DOMAIN="${DOMAIN:-monitoring.example.com}"
+DOMAIN="${DOMAIN:-monitor.example.com}"
 GRAFANA_HOST="${GRAFANA_HOST:-grafana}"
 RETENTION_TIME="${RETENTION_TIME:-90d}"
 RETENTION_SIZE="${RETENTION_SIZE:-20GB}"
@@ -34,6 +34,7 @@ PROJECT="${PROJECT:-$HOME/docker/monitoring}"
 SSHD_DROPIN="56-monitor-tunnel.conf"
 PROXY_VERSION="5421b44fdf4f0529670308558b6bf7f54ce7e1cc"   # v0.3.7
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DRY_RUN=0
 ASSUME_YES=0
 ROLLBACK=0
@@ -44,6 +45,8 @@ SUDO=""
 #   none   - no web server at all; Grafana stays on loopback, reach it with
 #            an SSH tunnel. Nothing is exposed, which is the safest default.
 WEB_MODE="${WEB_MODE:-nginx}"
+NO_ADMIN=0
+ADMIN_URL="${ADMIN_URL:-}"
 
 # ------------------------------------------------------------------ helpers ---
 c_ok()   { printf '\033[0;32m  ok\033[0m   %s\n' "$*"; }
@@ -259,6 +262,8 @@ while [ $# -gt 0 ]; do
     --project)        PROJECT="$2"; shift ;;
     --add-client-key) CLIENT_KEY="$2"; shift ;;
     --web)            WEB_MODE="$2"; shift ;;
+    --no-admin)       NO_ADMIN=1 ;;
+    --admin-url)      ADMIN_URL="$2"; shift ;;
     --help|-h)        usage ;;
     *) die "unknown option: $1 (try --help)" ;;
   esac
@@ -491,6 +496,12 @@ services:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./prometheus/rules:/etc/prometheus/rules:ro
       - prometheus_data:/prometheus
+    # Bound to loopback ONLY, so the admin panel (a host process) can query
+    # /api/v1/query for device health without joining monitoring_net. Loopback
+    # binding means nothing is reachable from the internet or the LAN. Remove
+    # this block if you run the panel as a container on the same network.
+    ports:
+      - "127.0.0.1:\${PROM_HOST_PORT:-9090}:9090"
     networks: [monitoring_net]
     security_opt: [no-new-privileges:true]
 
@@ -731,6 +742,20 @@ sh_run "mkdir -p '$PROJECT'"
 sh_run "cp -a '$STAGE/proj/.' '$PROJECT/'"
 sh_run "chmod 644 '$PROJECT/prometheus/prometheus.yml' '$PROJECT/prometheus/rules/node.yml' '$PROJECT/grafana/provisioning/datasources/prometheus.yml'"
 
+	# ---- publish the installer somewhere a service account can read
+	# The admin panel runs as its own unprivileged user and serves install.sh.
+	# A git clone under /home/<user> is mode 750, so it cannot read it from
+	# there; install a copy under /usr/local/share instead of loosening the
+	# home directory's permissions.
+	INSTALL_SHARE="/usr/local/share/monitoring"
+	sh_run "install -d -m 755 '$INSTALL_SHARE'"
+	if [ -f "$SCRIPT_DIR/install.sh" ]; then
+	  sh_run "install -m 644 '$SCRIPT_DIR/install.sh' '$INSTALL_SHARE/install.sh'"
+	  c_ok "installer published at $INSTALL_SHARE/install.sh"
+	else
+	  c_warn "install.sh not found next to this script; the panel will not serve it"
+	fi
+
 # ---- .env (generate the password, never hardcode one)
 if [ "$DRY_RUN" -eq 1 ]; then
   c_note "[dry-run] would generate $PROJECT/.env with a random admin password"
@@ -831,6 +856,27 @@ else
     fi
     c_ok "nginx reloaded"
   fi
+fi
+
+c_step "Admin panel (optional, --admin <url-path> or --no-admin)"
+# The panel mints one-line install commands and shows device health. It is a
+# separate binary so people who only want Grafana never need Go.
+if [ "$NO_ADMIN" -eq 1 ]; then
+  c_note "skipped (--no-admin)"
+else
+  ADMIN_URL="${ADMIN_URL:-}"
+  if [ -n "$ADMIN_URL" ] && have curl; then
+    if curl -fsS -m 10 -o /dev/null "$ADMIN_URL" 2>/dev/null; then
+      c_ok "existing panel reachable at $ADMIN_URL — leaving it alone"
+    else
+      c_warn "no panel at $ADMIN_URL; run the docker server script or install the binary:"
+      c_note "  make -C $0 install && systemctl enable --now monitoring-admin"
+    fi
+  else
+    c_note "no panel detected. The docker server script installs one automatically;"
+    c_note "for the native path:  make install && systemctl enable --now monitoring-admin"
+  fi
+  c_note "the installer is always available from the panel at <domain>/install.sh"
 fi
 
 # =========================================================== 10. bundle =======
