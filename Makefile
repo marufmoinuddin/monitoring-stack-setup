@@ -41,11 +41,15 @@ check: vet build
 	@if [ -f /tmp/mon-admin-smoke.pid ]; then \
 	   kill $$(cat /tmp/mon-admin-smoke.pid) 2>/dev/null || true; \
 	   rm -f /tmp/mon-admin-smoke.pid; sleep 1; fi
-	@rm -rf /tmp/mon-admin-smoke; mkdir -p /tmp/mon-admin-smoke
+	@rm -rf /tmp/mon-admin-smoke
+	@mkdir -p /tmp/mon-admin-smoke/home /tmp/mon-admin-smoke/project/ssh
 	@MON_LISTEN=127.0.0.1:18099 \
 	 MON_STATE_DIR=/tmp/mon-admin-smoke \
 	 MON_PROXY_PUBKEY='ssh-ed25519 AAAA-smoke-test' \
 	 MON_REPO_DIR=$(CURDIR) \
+	 MON_TUNNEL_USER_HOME=/tmp/mon-admin-smoke/home \
+	 MON_KNOWN_HOSTS=/tmp/mon-admin-smoke/known_hosts \
+	 MON_PROJECT_DIR=/tmp/mon-admin-smoke/project \
 	 nohup ./$(BINARY) >/tmp/mon-admin-smoke.log 2>&1 </dev/null & \
 	 echo $$! >/tmp/mon-admin-smoke.pid
 	@sleep 1

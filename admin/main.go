@@ -17,6 +17,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -47,12 +49,17 @@ type Config struct {
 	RepoDir       string
 	TunnelUser    string
 	InstallBase   string
+	// Enrolment: the client sends its own key through the tunnel and the server
+	// does the rest, so the operator never edits authorized_keys or YAML.
+	TunnelUserHome string
+	KnownHostsPath string
+	ProjectDir     string
 }
 
 type Device struct {
 	Name    string `json:"name"`
 	Port    int    `json:"port"`
-	PubKey  string `json:"pubkey"`
+	Token   string `json:"token"`
 	Created string `json:"created"`
 }
 
@@ -94,9 +101,22 @@ func main() {
 		cfg.InstallURL = cfg.InstallBase + "/install.sh"
 	}
 
-	if len(os.Args) > 1 && (os.Args[1] == "-version" || os.Args[1] == "--version") {
-		fmt.Println("monitoring-admin " + Version)
-		return
+	// One binary, two roles. `-enrol` is the SSH ForceCommand entry point used
+	// by clients during enrolment; with no flag it serves the HTTP panel. Keeping
+	// them in one binary means the panel and the enrolment path can never drift
+	// apart, and an operator installs exactly one file.
+	//
+	// Guard the index: running with no arguments is the normal way to start the
+	// panel, so os.Args[1] must not be read unguarded.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "-version", "--version":
+			fmt.Println("monitoring-admin " + Version)
+			return
+		case "-enrol", "--enrol":
+			handleEnrol()
+			return
+		}
 	}
 
 	if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
@@ -126,6 +146,57 @@ func main() {
 	}
 	log.Printf("listening on %s (domain %s, prometheus %s)", cfg.Listen, cfg.Domain, cfg.PrometheusURL)
 	log.Fatal(srv.ListenAndServe())
+}
+
+// TunnelHostPort renders the address a device's reverse port binds on.
+func (c Config) TunnelHostPort(port int) string {
+	return fmt.Sprintf("%s:%d", c.TunnelHost, port)
+}
+
+// loadConfig reads configuration from the environment. Shared by the HTTP panel
+// and the enrolment path so the two can never disagree about where things live.
+func loadConfig() (Config, error) {
+	cfg := Config{
+		Listen:          env("MON_LISTEN", "127.0.0.1:8099"),
+		Domain:          env("MON_DOMAIN", "monitor.example.com"),
+		TunnelHost:      env("MON_TUNNEL_HOST", "127.0.0.1"),
+		TunnelUser:      env("MON_TUNNEL_USER", "monitor"),
+		TunnelUserHome:  env("MON_TUNNEL_USER_HOME", "/home/monitor"),
+		KnownHostsPath:  env("MON_KNOWN_HOSTS", ""),
+		PrometheusURL:   env("MON_PROMETHEUS_URL", "http://127.0.0.1:9090"),
+		StateDir:        env("MON_STATE_DIR", "/var/lib/monitoring-admin"),
+		ProjectDir:      env("MON_PROJECT_DIR", ""),
+	}
+	if cfg.KnownHostsPath == "" && cfg.ProjectDir != "" {
+		cfg.KnownHostsPath = cfg.ProjectDir + "/ssh/known_hosts"
+	}
+	if cfg.KnownHostsPath == "" {
+		return cfg, fmt.Errorf("MON_KNOWN_HOSTS or MON_PROJECT_DIR must be set")
+	}
+	return cfg, nil
+}
+
+// runWithTimeout runs a command with a deadline so a hung ssh-keyscan cannot
+// wedge the HTTP panel.
+func runWithTimeout(c *exec.Cmd, d time.Duration) (string, error) {
+	if err := c.Start(); err != nil {
+		return "", err
+	}
+	done := make(chan struct{})
+	var out []byte
+	var err error
+	go func() {
+		out, err = c.Output()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return string(out), err
+	case <-time.After(d):
+		_ = c.Process.Kill()
+		<-done
+		return string(out), fmt.Errorf("timed out after %s", d)
+	}
 }
 
 func envInt(k string, def int) int {
@@ -293,34 +364,17 @@ func (s *Server) createDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	keyDir := s.cfg.StateDir + "/keys"
-	if err := os.MkdirAll(keyDir, 0o700); err != nil {
-		s.mu.Unlock()
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	keyPath := keyDir + "/" + name
-	if _, err := os.Stat(keyPath); err == nil {
-		s.mu.Unlock()
-		http.Error(w, "key already exists for "+name, http.StatusConflict)
-		return
-	}
-	cmd := exec.Command("ssh-keygen", "-t", "ed25519", "-N", "", "-C", name+"-to-"+s.cfg.Domain, "-f", keyPath)
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		s.mu.Unlock()
-		http.Error(w, "ssh-keygen failed: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	pubBytes, err := os.ReadFile(keyPath + ".pub")
+	// Mint an enrolment token. NOT a keypair: the tunnel key belongs to the
+	// client, which generates it during install and hands it to us over the
+	// tunnel. The panel's only jobs are to reserve a port and issue a token.
+	token, err := newToken()
 	if err != nil {
 		s.mu.Unlock()
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "could not mint a token: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	pub := strings.TrimSpace(string(pubBytes))
 
-	d := Device{Name: name, Port: port, PubKey: pub, Created: time.Now().UTC().Format(time.RFC3339)}
+	d := Device{Name: name, Port: port, Token: token, Created: time.Now().UTC().Format(time.RFC3339)}
 	s.devices = append(s.devices, d)
 	err = s.saveLocked(s.devices)
 	s.mu.Unlock()
@@ -329,11 +383,21 @@ func (s *Server) createDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Nothing for the operator to do on the server: the client enrols itself.
 	writeJSON(w, map[string]any{
-		"device":         d,
-		"install_command": s.installCommand(name, port),
-		"server_steps":   s.serverSteps(d),
+		"device":          d,
+		"install_command": s.installCommand(name, port, token),
+		"note": "Run this on the client. It installs everything and registers itself with the server over the tunnel. There is nothing else to do on the server.",
 	})
+}
+
+// newToken returns a short random token used to tie an enrolment to this panel.
+func newToken() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
 func (s *Server) nextPortLocked() int {
@@ -375,28 +439,18 @@ func validName(n string) bool {
 //     parses as an input redirection and dies with "cannot open a" or
 //     "Syntax error: newline unexpected" before any code runs. So the check
 //     must happen in the command, not inside the script.
-func (s *Server) installCommand(name string, port int) string {
-	dl := s.cfg.InstallURL
+func (s *Server) installCommand(name string, port int, token string) string {
 	return fmt.Sprintf(
 		"curl -fsSL %s -o /tmp/install-monitoring.sh && "+
 			"head -1 /tmp/install-monitoring.sh | grep -q '^#!' || "+
 			"{ echo \"ERROR: that URL returned a web page, not the installer.\"; "+
-			"echo \"The admin panel must be published at https://monitor-admin.<your-domain>/\"; "+
+			"echo \"Check it points at the admin panel's own host.\"; "+
 			"head -2 /tmp/install-monitoring.sh; exit 1; }; "+
 			"chmod +x /tmp/install-monitoring.sh && "+
-			"sudo /tmp/install-monitoring.sh --name %s --port %d --user %s --server %s --key %q",
-		dl, name, port, s.cfg.TunnelUser, s.cfg.Domain, s.cfg.ProxyPubkey,
+			"sudo /tmp/install-monitoring.sh --name %s --port %d --user %s --server %s "+
+			"--enrol-token %s --key %q",
+		s.cfg.InstallURL, name, port, s.cfg.TunnelUser, s.cfg.Domain, token, s.cfg.ProxyPubkey,
 	)
-}
-
-// serverSteps are the things only the operator can do, on the server.
-func (s *Server) serverSteps(d Device) []string {
-	return []string{
-		fmt.Sprintf("sudo tee -a /home/monitor/.ssh/authorized_keys >/dev/null <<'EOF'\nrestrict,port-forwarding,permitlisten=\"%s:%d\" %s\nEOF",
-			s.cfg.TunnelHost, d.Port, d.PubKey),
-		fmt.Sprintf("sudo chmod 600 /home/monitor/.ssh/authorized_keys && sudo chown monitor:monitor /home/monitor/.ssh/authorized_keys"),
-		fmt.Sprintf("# then pin the client host key once its tunnel is up:\n#   ssh-keyscan -p %d %s 2>/dev/null | grep -v '^#' >> %s", d.Port, s.cfg.TunnelHost, s.cfg.StateDir+"/known_hosts"),
-	}
 }
 
 func (s *Server) handleDeviceByName(w http.ResponseWriter, r *http.Request) {
@@ -431,15 +485,7 @@ func (s *Server) handleDeviceByName(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	_ = os.Remove(s.cfg.StateDir + "/keys/" + name)
-	_ = os.Remove(s.cfg.StateDir + "/keys/" + name + ".pub")
-	writeJSON(w, map[string]any{
-		"revoked": name,
-		"server_steps": []string{
-			fmt.Sprintf("# remove the line for %q from /home/monitor/.ssh/authorized_keys", name),
-			fmt.Sprintf("# remove its target from prometheus.yml, then reload Prometheus"),
-		},
-	})
+	writeJSON(w, map[string]any{"revoked": name})
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -621,20 +667,19 @@ async function add(){
 }
 function esc(s){const d=document.createElement('div');d.textContent=s||'';return d.innerHTML}
 function render(j){
-  let h='<div class="panel"><h2 style="margin-top:0">'+esc(j.device.name)+' created on port '+j.device.port+'</h2>';
-  h+='<label>1 &mdash; run this on the client</label><div class="cmd" id="c1">'+esc(j.install_command)+'</div>';
+  let h='<div class="panel"><h2 style="margin-top:0">'+esc(j.device.name)+' reserved on port '+j.device.port+'</h2>';
+  h+='<div class="note">'+esc(j.note||'')+'</div>';
+  h+='<label>Run this on the client</label><div class="cmd" id="c1">'+esc(j.install_command)+'</div>';
   h+='<button class="ghost" onclick="cp(\'c1\',this)">copy</button>';
-  h+='<label style="margin-top:18px">2 &mdash; then on THIS server, authorise the key</label>';
-  j.server_steps.forEach(function(s,i){ h+='<div class="cmd" id="s'+i+'">'+esc(s)+'</div><button class="ghost" onclick="cp(\'s'+i+'\',this)">copy</button>'; });
-  h+='<p class="note">The client will not report until its tunnel is up. Watch the table below, or check the proxy log.</p></div>';
+  h+='<p class="note">The client installs itself and registers over the tunnel. '+
+     'There is no second step on the server &mdash; it authorises the key, pins the host key, '+
+     'and adds the scrape target itself.</p></div>';
   return h;
 }
 async function revoke(name){
-  if(!confirm('Revoke '+name+'? Its key is deleted and it will stop reporting.'))return;
+  if(!confirm('Revoke '+name+'? It will stop reporting.'))return;
   const r=await fetch('/api/devices/'+encodeURIComponent(name),{method:'DELETE'});
-  const j=await r.json();
-  if(!r.ok){alert(j);return}
-  alert('Revoked.\\n\\n'+j.server_steps.join('\\n'));
+  if(!r.ok){alert(await r.text());return}
   location.reload();
 }
 function cp(id,btn){

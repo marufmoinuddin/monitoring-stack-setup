@@ -13,6 +13,7 @@ INSTALLER="$HERE/install.sh"
 PASS=0
 FAIL=0
 
+eval "$(awk '/^_osrel_field\(\)/,/^}/'  "$INSTALLER")"
 eval "$(awk '/^is_alpine\(\)/,/^}/'     "$INSTALLER")"
 eval "$(awk '/^detect_distro\(\)/,/^}/' "$INSTALLER")"
 
@@ -66,6 +67,14 @@ run_case alpine    'ID=alpine' no  apk          'alpine/apk/prometheus-node-expo
 run_case suse      'ID=opensuse-tumbleweed' no  zypper       'suse/zypper/prometheus-node_exporter'
 run_case void      'ID=void' no  xbps-install 'void/xbps-install/prometheus-node-exporter'
 run_case gentoo    'ID=gentoo' no  emerge       'gentoo/emerge/dev-util/prometheus-node-exporter'
+
+# The device label must survive detection: os-release defines NAME too.
+NAME="test-device"
+rel="$TMPDIR_T/name-os-release"
+printf 'NAME=CachyOS Linux\nID=cachyos\nID_LIKE=arch\n' > "$rel"
+FAKE="pacman"
+OS_RELEASE="$rel" ALPINE_RELEASE=/nonexistent detect_distro
+check "name-clobber" "test-device" "$NAME"
 
 echo
 printf '=== %d passed, %d failed ===\n' "$PASS" "$FAIL"

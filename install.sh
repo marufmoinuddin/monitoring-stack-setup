@@ -42,6 +42,17 @@ PUBKEY=""
 # tunnel identities (one per trust domain), so this is configurable rather than
 # hardcoded to "monitor".
 TUNNEL_USER="monitor"
+# SSH_HOST is where the tunnel actually connects. It defaults to --server, but
+# you can point it at an IP when the hostname has a broken AAAA record.
+SSH_HOST=""
+# TUNNEL_HOST is the address the reverse port binds on the server. In Docker
+# mode that is the private bridge gateway; natively it is loopback.
+TUNNEL_HOST="127.0.0.1"
+# Enrolment: the client hands its own public key to the server through the
+# tunnel, and the server does the rest. NO_ENROL is the escape hatch for a
+# hand-managed install.
+ENROL_TOKEN=""
+NO_ENROL=0
 # Resolve the real user's identity BEFORE acting. Under sudo, $HOME is usually
 # reset to /root, so a unit that referenced /root/.ssh/... while running as the
 # invoking user would silently fail to authenticate. sudo always exports
@@ -81,6 +92,14 @@ Options:
   --server <host>     monitoring server hostname (required)
   --key "<pubkey>"    server proxy public key (required)
   --user <name>       tunnel account on the server (default: monitor)
+  --ssh-host <host>   address the tunnel dials (default: --server).
+                      Use this when the hostname has a broken AAAA record.
+  --tunnel-host <ip>  address the reverse port binds on the server
+                      (default: 127.0.0.1; Docker mode uses 172.30.0.1)
+  --enrol-token <t>   enrolment token from the admin panel. With this, the
+                      installer registers itself with the server over the tunnel
+                      and you need do nothing else on the server.
+  --no-enrol          do not self-enrol (for a hand-managed install)
   --keyfile <path>    tunnel private key path
                       (default: ~/.ssh/monitoring_tunnel)
   --dry-run           print what would happen, change nothing
@@ -97,6 +116,10 @@ while [ $# -gt 0 ]; do
     --server)        SERVER="$2"; shift ;;
     --key)           PUBKEY="$2"; shift ;;
     --user)          TUNNEL_USER="$2"; shift ;;
+    --ssh-host)      SSH_HOST="$2"; shift ;;
+    --tunnel-host)   TUNNEL_HOST="$2"; shift ;;
+    --enrol-token)   ENROL_TOKEN="$2"; shift ;;
+    --no-enrol)      NO_ENROL=1 ;;
     --keyfile)       KEYFILE="$2"; shift ;;
     --dry-run)       DRY_RUN=1 ;;
     --skip-packages) SKIP_PACKAGES=1 ;;
@@ -157,16 +180,40 @@ PKG_EXPORTER=""
 PKG_AUTOSSH=""
 PKG_SSHCLIENT=""
 
+# _osrel_field <file> <KEY> — read one KEY=value from an os-release-style file
+# without sourcing it. Works whether the file is one pair per line or several
+# pairs on one line, and strips surrounding quotes.
+_osrel_field() {
+  local file="$1" key="$2" val=""
+  [ -r "$file" ] || return 0
+  # One per line first, then fall back to a space-separated single line.
+  val="$(sed -n "s/^${key}=//p" "$file" 2>/dev/null | head -1)"
+  if [ -z "$val" ]; then
+    val="$(sed -n "s/.*[[:space:]]${key}=//p" "$file" 2>/dev/null | head -1)"
+  fi
+  # Strip matching surrounding quotes, then any stray whitespace.
+  val="${val%\"}"; val="${val#\"}"
+  val="${val%\'}"; val="${val#\'}"
+  printf '%s' "$val" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
 detect_distro() {
   local id="" like=""
   # OS_RELEASE exists so the test harness can point this at a fixture. It never
   # touches the real /etc/os-release.
   local osrel="${OS_RELEASE:-/etc/os-release}"
   if [ -r "$osrel" ]; then
-    # shellcheck disable=SC1090
-    . "$osrel" 2>/dev/null || true
-    id="${ID:-}"
-    like="${ID_LIKE:-}"
+    # Sourcing os-release defines NAME, ID, VERSION and friends. Several of
+    # those collide with this script's own variables — most importantly NAME,
+    # which is our device label. Sourcing straight into the global scope meant
+    # a device got labelled "CachyOS Linux" because os-release said
+    # NAME="CachyOS Linux". Parse the two fields we need instead.
+    #
+    # Real os-release files put one KEY=value per line, but accept a single
+    # line with several pairs too so a compact fixture (and the odd minimal
+    # /etc/os-release in a container) still works.
+    id="$(_osrel_field "$osrel" ID)"
+    like="$(_osrel_field "$osrel" ID_LIKE)"
   fi
   [ -f /etc/alpine-release ] && DISTRO="alpine"
 
@@ -380,10 +427,19 @@ configure_promssh() {
 
   # Without AllowTcpForwarding the proxy cannot work at all, and this is the
   # single most common reason a hand-rolled install fails.
-  if ! $SUDO sshd -T 2>/dev/null | grep -qiE '^allowtcpforwarding (yes|all)'; then
-    warn "sshd does not allow TCP forwarding — the server will not be able to scrape."
-    warn "check: sudo sshd -T | grep -i allowtcpforwarding"
-  fi
+  # "local" still permits reverse (-R) forwarding, which is all we use, so it
+  # is fine. Only a hard "no" blocks us.
+  _atf="$($SUDO sshd -T 2>/dev/null | grep -iE '^allowtcpforwarding' | head -1 | awk '{print $2}')"
+  case "$_atf" in
+    yes|all|remote|local) : ;;
+    no|"")
+      warn "sshd does not allow TCP forwarding (${_atf:-unknown}) — the server cannot scrape."
+      warn "fix in /etc/ssh/sshd_config.d/:  AllowTcpForwarding yes"
+      warn "then: sudo sshd -t && sudo systemctl reload ssh"
+      ;;
+    *)
+      warn "unexpected AllowTcpForwarding value: $_atf" ;;
+  esac
 }
 
 # --------------------------------------------------------------- tunnel -----
@@ -416,10 +472,13 @@ configure_tunnel() {
     printf '       [dry-run] would pin the host key for %s in %s\n' "$SERVER" "$KNOWN_HOSTS"
   else
     $SUDO touch "$KNOWN_HOSTS"
-    ssh-keyscan -H "$SERVER" 2>/dev/null | $SUDO tee -a "$KNOWN_HOSTS" >/dev/null || true
+    # Pin the name the tunnel will actually dial. With StrictHostKeyChecking=yes
+    # ssh compares the presented key against the entry for that exact host, so
+    # pinning "$SERVER" while dialling "$SSH_HOST" would fail verification.
+    ssh-keyscan -H "$SSH_HOST" 2>/dev/null | $SUDO tee -a "$KNOWN_HOSTS" >/dev/null || true
     $SUDO chmod 644 "$KNOWN_HOSTS"
     $SUDO chown "$RUN_USER:$RUN_USER" "$KNOWN_HOSTS" 2>/dev/null || true
-    say "pinned host key for $SERVER in $KNOWN_HOSTS"
+    say "pinned host key for $SSH_HOST in $KNOWN_HOSTS"
   fi
 
   local unit=/etc/systemd/system/monitoring-tunnel.service
@@ -442,7 +501,13 @@ Type=simple
 # The tunnel must run as the invoking user, not root: it reads that user's
 # private key and known_hosts, and a root-owned unit cannot read them.
 User=$RUN_USER
-Environment=AUTOSSH_GATETIME=0
+  Environment=AUTOSSH_GATETIME=0
+# AddressFamily=inet is not optional. If the dashboard hostname carries a
+  # stale AAAA record (DuckDNS and friends often publish a link-local address
+  # like fe80::...), ssh will try IPv6 first and fail with
+  # "connect to host <name> port 22: Connection refused" or "Invalid argument",
+  # even though IPv4 works perfectly. Forcing inet removes that whole class of
+# failure.
 ExecStart=/usr/bin/autossh -M 0 -N -T \\
   -o ExitOnForwardFailure=yes \\
   -o ServerAliveInterval=15 \\
@@ -451,8 +516,8 @@ ExecStart=/usr/bin/autossh -M 0 -N -T \\
   -o IdentitiesOnly=yes \\
   -o AddressFamily=inet \\
   -i $KEYFILE \\
-  -R 127.0.0.1:$PORT:127.0.0.1:22 \\
-  $TUNNEL_USER@$SERVER
+  -R $TUNNEL_HOST:$PORT:127.0.0.1:22 \\
+  $TUNNEL_USER@$SSH_HOST
 Restart=always
 RestartSec=$AUTOSSH_RESTART
 
@@ -461,8 +526,92 @@ WantedBy=multi-user.target
 EOF
 
   $SUDO systemctl daemon-reload
+  # Enable AND start. Enabling alone leaves the unit inactive until the next
+  # boot, which looks identical to a broken install: the exporter is healthy
+  # and nothing reports.
   $SUDO systemctl enable monitoring-tunnel.service 2>/dev/null || true
-  say "tunnel unit installed"
+  $SUDO systemctl restart monitoring-tunnel.service
+  sleep 3
+  if [ "$(systemctl is-active monitoring-tunnel.service 2>/dev/null || echo inactive)" = "active" ]; then
+    say "tunnel running"
+    enrol_self
+  else
+    warn "the tunnel unit did not stay active — check:"
+    warn "  sudo journalctl -u monitoring-tunnel -n 30"
+    warn "the usual cause is that the server has not authorised your key yet."
+  fi
+}
+
+
+# ------------------------------------------------------------- enrol -------
+# Hand our public key to the server through the tunnel that is already open, and
+# let the server add authorized_keys, pin our host key and add the Prometheus
+# target. After this the device reports; there is nothing left for the operator
+# to do on the server.
+#
+# We retry because the tunnel may still be coming up, and because the very first
+# connection can race the server's own reload.
+enrol_self() {
+  [ "$NO_ENROL" -eq 1 ] && { say "skipped self-enrolment (--no-enrol)"; return 0; }
+  if [ -z "$ENROL_TOKEN" ]; then
+    say "no --enrol-token: skipping self-enrolment."
+    c_note "the device will NOT report until the server is told about it."
+    return 0
+  fi
+
+  local payload pubkey
+  pubkey="$(cat "$KEYFILE.pub" 2>/dev/null || true)"
+  [ -n "$pubkey" ] || { warn "cannot read $KEYFILE.pub — cannot enrol"; return 1; }
+
+  # JSON-escape the pubkey comment defensively; it is our own hostname so it
+  # should never need it, but a stray quote would produce invalid JSON.
+  local esc
+  esc="$(printf '%s' "$pubkey" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+
+  payload=$(printf '{"token":"%s","device":"%s","port":%d,"pubkey":"%s","comment":"%s"}' \
+      "$ENROL_TOKEN" "$NAME" "$PORT" "$esc" "$NAME-to-$SERVER")
+
+  say "registering with the server over the tunnel"
+
+  local attempt out rc connected=0
+  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    # The ForceCommand runs on the server and reads stdin, so we pipe the
+    # payload in and read its reply from stdout.
+    out="$(printf '%s' "$payload" | timeout 30 ssh -T \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            -o IdentitiesOnly=yes \
+            -o AddressFamily=inet \
+            -o ExitOnForwardFailure=no \
+            -i "$KEYFILE" \
+            -p "$PORT" \
+            "$TUNNEL_USER@$SERVER" 2>/dev/null)" && connected=1 || true
+
+    if [ -n "$out" ]; then
+      # The server replies with one JSON object. Pull out the message without
+      # assuming jq is present.
+      case "$out" in
+        *'"ok":true'*)
+          say "enrolled: $(printf '%s' "$out" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p')"
+          say "that is everything — this device will appear on the dashboard."
+          return 0 ;;
+        *)
+          warn "server refused: $(printf '%s' "$out" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p')"
+          warn "raw reply: $out"
+          return 1 ;;
+      esac
+    fi
+
+    # No reply yet: most likely the tunnel is still establishing, or the server
+    # has not yet reloaded the ForceCommand for our account.
+    printf '       attempt %d/10 — no reply, waiting 10s\n' "$attempt"
+    sleep 10
+  done
+
+  warn "could not reach the enrolment endpoint after 10 attempts."
+  warn "check that the tunnel is up:  $SUDO journalctl -u monitoring-tunnel -n 20"
+  warn "then re-run this installer, or enrol by hand on the server."
+  return 1
 }
 
 # ---------------------------------------------------------------- verify ----
@@ -483,20 +632,31 @@ verify() {
   cat <<EOF
 $(printf '%s')Done.$(printf '%s')
 
-This machine will not appear on the dashboard until the SERVER has
-authorised your key. The admin panel prints the exact command:
+$(printf '\033[1;33m')YOUR PUBLIC KEY -- the server needs exactly this line$(printf '\033[0m')
 
-  1. Copy the "authorise the key" command from the panel and run it as root
-     on the server. It authorises the tunnel account "$TUNNEL_USER".
-  2. Once your tunnel is up, the server pins your host key:
-       ssh-keyscan -p $PORT $SERVER 2>/dev/null | grep -v '^#' >> <proxy>/known_hosts
-  3. Watch it come alive:
-       sudo journalctl -u monitoring-tunnel -f
-       sudo ss -lntp | grep $PORT     # on the SERVER
+The tunnel keypair is generated HERE, on this machine, not on the server -- the
+server has never seen it. Paste this single line on the server as root, into
+the tunnel account's authorized_keys:
+
+$( [ -f "$KEYFILE.pub" ] && sed 's/^/  /' "$KEYFILE.pub" || echo "  (could not read $KEYFILE.pub)" )
+
+Then, on the server:
+
+  1. pin this machine's host key (once the tunnel is up):
+       ssh-keyscan -p $PORT $SERVER 2>/dev/null | grep -v '^#' >> <proxy-dir>/known_hosts
+  2. add the target to Prometheus so it gets scraped:
+       - targets: ['$TUNNEL_HOST:$PORT']
+         labels:
+           device: $NAME
+     then reload Prometheus:  docker compose kill -s HUP prometheus
+
+Watch it come alive:
+  $SUDO journalctl -u monitoring-tunnel -f      # here, on the client
+  ss -lntp | grep $PORT                          # on the server
 
 If it does not report, the server log names the cause:
-       docker compose logs --tail=20 http-over-ssh      # docker server
-       journalctl -u http-over-ssh -n 20               # native server
+  docker compose logs --tail=20 http-over-ssh      # docker server
+  journalctl -u http-over-ssh -n 20               # native server
 EOF
 }
 
@@ -522,6 +682,8 @@ fi
 [ -n "$PORT" ]  || die "--port is required (try --help)"
 [ -n "$SERVER" ] || die "--server is required (try --help)"
 [ -n "$PUBKEY" ] || die "--key is required (try --help)"
+# The tunnel dials SSH_HOST, which defaults to the dashboard host.
+[ -n "$SSH_HOST" ] || SSH_HOST="$SERVER"
 case "$PORT" in ''|*[!0-9]*) die "--port must be numeric, got '$PORT'" ;; esac
 case "$PUBKEY" in
   ssh-ed25519\ *|ssh-rsa\ *|ecdsa-sha2-*\ *) ;;
