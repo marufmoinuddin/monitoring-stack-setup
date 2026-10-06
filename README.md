@@ -74,6 +74,8 @@ open. Nothing listens on the internet except nginx on 80/443.
 | `monitoring-server-setup-native.sh` | Server setup, native systemd mode. |
 | `monitoring-client-setup.sh` | Bundle-based client setup (the older path). |
 | `Makefile` | `make build` / `make check` / `make install` for the panel. |
+| `test-detect-distro.sh` | Verifies the per-distro package table (12 distributions). |
+| `fix-admin-env.sh` | Rewrites the panel's env file so systemd does not truncate the key. |
 | `docs/BESZEL-RESEARCH.md` | What we took from Beszel, and what we deliberately did not. |
 
 ## Quick start
@@ -275,6 +277,16 @@ Each was hit for real while building this:
     (`docker network inspect proxy_net --format
     '{{range .IPAM.Config}}{{.Gateway}}{{end}}'`). That address is not routable
     from outside, so nothing is newly exposed.
+12. **Package names differ per distro.** Asking Arch for
+    `prometheus-node_exporter` fails with `target not found`; it ships
+    `prometheus-node-exporter`. The installer now detects the distribution once
+    from `/etc/os-release` and picks the manager and package names from a table,
+    rather than guessing per call. `test-detect-distro.sh` exercises that table
+    against synthetic os-release fixtures for 12 distributions.
+13. **`MON_PROXY_PUBKEY` contains a space and systemd splits on whitespace.**
+    `EnvironmentFile=` truncated the key to `ssh-ed25519` and turned its comment
+    into a stray variable, silently. Keep such values on one line and unquoted;
+    `fix-admin-env.sh` rewrites the file correctly.
 
 ## Verified end to end
 

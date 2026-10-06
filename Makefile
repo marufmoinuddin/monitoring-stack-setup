@@ -14,7 +14,7 @@ GO      ?= go
 # which fails on an air-gapped or slow build host.
 export GOTOOLCHAIN := local
 
-.PHONY: all build vet check test install clean
+.PHONY: all build vet check test install clean test-distro
 
 all: build
 
@@ -73,7 +73,11 @@ check: vet build
 	@rm -f /tmp/mon-admin-smoke.pid
 	@echo "    all checks passed"
 
-test: check
+# The installer's distro/package table, checked against os-release fixtures.
+test-distro:
+	@./test-detect-distro.sh
+
+test: check test-distro
 
 install: build
 	install -m 0755 $(BINARY) $(PREFIX)/$(BINARY)

@@ -108,7 +108,7 @@ while [ $# -gt 0 ]; do
 done
 
 # ------------------------------------------------------------- preflight ----
-is_alpine() { [ -f /etc/alpine-release ]; }
+is_alpine() { [ -f "${ALPINE_RELEASE:-/etc/alpine-release}" ]; }
 
 check_platform() {
   case "$(uname -s)" in
@@ -124,6 +124,12 @@ check_platform() {
       || die "a running systemd is required (found none)"
   fi
   [ "$(id -u)" -eq 0 ] || die "run with sudo: sudo $0 ..."
+
+  # Identify the distribution now, so every later step knows which package
+  # manager and package names to use. This must happen before any install.
+  detect_distro
+  # Referenced here as $SUDO only for symmetry; real work happens in pkg_install.
+  : "$SUDO"
 }
 
 SUDO=""
@@ -132,43 +138,151 @@ SUDO=""
 # --------------------------------------------------------------- packages ---
 pkg_installed() { command -v "$1" >/dev/null 2>&1; }
 
+# Identify the distribution ONCE, up front, from /etc/os-release, and pick both
+# the package manager and the correct package names from a table. Guessing names
+# per-call is how the installer ended up asking Arch for
+# "prometheus-node_exporter" and failing with "target not found".
+#
+#   distro      exporter package            autossh        ssh client
+#   debian      prometheus-node-exporter   autossh        openssh-client
+#   arch        prometheus-node-exporter   autossh        openssh
+#   fedora      prometheus-node-exporter   autossh        openssh-clients
+#   alpine      prometheus-node-exporter   autossh        openssh-client
+#
+# Note the Alpine name really does use an underscore in some releases; the
+# fallback list below covers that rather than betting on one spelling.
+DISTRO=""
+PKG_MGR=""
+PKG_EXPORTER=""
+PKG_AUTOSSH=""
+PKG_SSHCLIENT=""
+
+detect_distro() {
+  local id="" like=""
+  # OS_RELEASE exists so the test harness can point this at a fixture. It never
+  # touches the real /etc/os-release.
+  local osrel="${OS_RELEASE:-/etc/os-release}"
+  if [ -r "$osrel" ]; then
+    # shellcheck disable=SC1090
+    . "$osrel" 2>/dev/null || true
+    id="${ID:-}"
+    like="${ID_LIKE:-}"
+  fi
+  [ -f /etc/alpine-release ] && DISTRO="alpine"
+
+  if [ -z "$DISTRO" ]; then
+    case "$id" in
+      debian|ubuntu|raspbian|devuan) DISTRO="debian" ;;
+      arch|manjaro|endeavouros|cachyos|garuda) DISTRO="arch" ;;
+      fedora|rhel|centos|rocky|alma|ol) DISTRO="fedora" ;;
+      alpine) DISTRO="alpine" ;;
+      opensuse*|sles|sled) DISTRO="suse" ;;
+      void) DISTRO="void" ;;
+      gentoo) DISTRO="gentoo" ;;
+      *)
+        # Fall back on ID_LIKE for derivatives that do not set a known ID.
+        case "$like" in
+          *debian*) DISTRO="debian" ;;
+          *arch*)   DISTRO="arch" ;;
+          *fedora*|*rhel*) DISTRO="fedora" ;;
+          *alpine*) DISTRO="alpine" ;;
+          *suse*)   DISTRO="suse" ;;
+          *) DISTRO="unknown" ;;
+        esac
+        ;;
+    esac
+  fi
+
+  case "$DISTRO" in
+    debian)  PKG_MGR="apt-get" ;;
+    arch)    PKG_MGR="pacman" ;;
+    fedora)  if pkg_installed dnf; then PKG_MGR="dnf"; else PKG_MGR="yum"; fi ;;
+    alpine)  PKG_MGR="apk" ;;
+    suse)    PKG_MGR="zypper" ;;
+    void)    PKG_MGR="xbps-install" ;;
+    gentoo)  PKG_MGR="emerge" ;;
+    *)       PKG_MGR="unknown" ;;
+  esac
+
+  case "$DISTRO" in
+    debian)  PKG_EXPORTER="prometheus-node-exporter"; PKG_SSHCLIENT="openssh-client" ;;
+    arch)    PKG_EXPORTER="prometheus-node-exporter"; PKG_SSHCLIENT="openssh" ;;
+    fedora)  PKG_EXPORTER="node_exporter";             PKG_SSHCLIENT="openssh-clients" ;;
+    alpine)  PKG_EXPORTER="prometheus-node-exporter"; PKG_SSHCLIENT="openssh-client" ;;
+    suse)    PKG_EXPORTER="prometheus-node_exporter"; PKG_SSHCLIENT="openssh-clients" ;;
+    void)    PKG_EXPORTER="prometheus-node-exporter"; PKG_SSHCLIENT="openssh" ;;
+    gentoo)  PKG_EXPORTER="dev-util/prometheus-node-exporter"; PKG_SSHCLIENT="net-misc/openssh" ;;
+    *)       PKG_EXPORTER="prometheus-node-exporter"; PKG_SSHCLIENT="openssh-client" ;;
+  esac
+  PKG_AUTOSSH="autossh"
+
+  # If the distro's own manager is not installed, fall back to whatever we can
+  # find — but only among managers that actually exist. In tests (and on a host
+  # where the detected manager is absent) this must not silently select the
+  # manager of the machine running the tests.
+  if [ "$PKG_MGR" != "unknown" ] && ! pkg_installed "$PKG_MGR"; then
+    local found=""
+    for m in apt-get dnf yum pacman apk zypper xbps-install emerge; do
+      if pkg_installed "$m"; then found="$m"; break; fi
+    done
+    if [ -n "$found" ]; then
+      PKG_MGR="$found"
+    fi
+  fi
+}
+
+# pkg_install <pkg> [extra...] — install via the detected manager.
+pkg_install() {
+  [ "$PKG_MGR" = "unknown" ] && return 1
+  case "$PKG_MGR" in
+    apt-get)
+      $SUDO apt-get update -qq || return 1
+      DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y "$@" || return 1
+      ;;
+    dnf)     $SUDO dnf install -y "$@" || return 1 ;;
+    yum)     $SUDO yum install -y "$@" || return 1 ;;
+    pacman)  $SUDO pacman -S --needed --noconfirm "$@" || return 1 ;;
+    apk)     $SUDO apk add --no-cache "$@" || return 1 ;;
+    zypper)  $SUDO zypper --non-interactive install "$@" || return 1 ;;
+    xbps-install) $SUDO xbps-install -yS "$@" || return 1 ;;
+    emerge)  $SUDO emerge "$@" || return 1 ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
 install_packages() {
   [ "$SKIP_PACKAGES" -eq 1 ] && { say "skipping packages (--skip-packages)"; return 0; }
+
   if pkg_installed prometheus-node-exporter || pkg_installed node_exporter; then
     say "node_exporter already present"
     return 0
   fi
-  say "installing node_exporter"
-  if pkg_installed apk; then
-    apk add --no-cache prometheus-node_exporter curl
-  elif pkg_installed apt-get; then
-    $SUDO apt-get update -qq
-    # DEBIAN_FRONTEND must be exported, not prefixed: with SUDO in front,
-    # "DEBIAN_FRONTEND=x sudo apt-get" is parsed by sh as a command name.
-    DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y prometheus-node-exporter
-  elif pkg_installed dnf; then
-    $SUDO dnf install -y prometheus-node_exporter curl
-  elif pkg_installed yum; then
-    $SUDO yum install -y prometheus-node_exporter curl
-  elif pkg_installed pacman; then
-    $SUDO pacman -S --needed --noconfirm prometheus-node_exporter curl
-  elif pkg_installed zypper; then
-    $SUDO zypper --non-interactive install prometheus-node_exporter curl
-  else
-    die "no supported package manager found (need apk/apt/dnf/yum/pacman/zypper)"
+  say "installing $PKG_EXPORTER (on $DISTRO via $PKG_MGR)"
+  if pkg_install "$PKG_EXPORTER" curl; then
+    return 0
   fi
+  # Some releases ship the other spelling. Try it before giving up.
+  local alt
+  for alt in prometheus-node_exporter node_exporter; do
+    [ "$alt" = "$PKG_EXPORTER" ] && continue
+    say "$PKG_EXPORTER unavailable, trying $alt"
+    if pkg_install "$alt"; then
+      return 0
+    fi
+  done
+  die "could not install node_exporter under any known package name on $DISTRO.
+  Install it by hand, then re-run with --skip-packages. Try:
+    $PKG_MGR ... $( [ "$DISTRO" = arch ] && echo 'pacman -S prometheus-node-exporter' || echo "$PKG_EXPORTER" )"
 }
 
 install_autossh() {
-  pkg_installed autossh && { say "autossh already present"; return 0; }
+  if pkg_installed autossh; then
+    say "autossh already present"
+    return 0
+  fi
   say "installing autossh"
-  if pkg_installed apk; then apk add --no-cache autossh openssh-client
-  elif pkg_installed apt-get; then DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y autossh openssh-client
-  elif pkg_installed dnf; then $SUDO dnf install -y autossh openssh-clients
-  elif pkg_installed yum; then $SUDO yum install -y autossh openssh-clients
-  elif pkg_installed pacman; then $SUDO pacman -S --needed --noconfirm autossh openssh
-  elif pkg_installed zypper; then $SUDO zypper --non-interactive install autossh openssh-clients
-  else die "no supported package manager found"; fi
+  pkg_install "$PKG_AUTOSSH" || warn "could not install autossh automatically — install it and re-run"
 }
 
 # ----------------------------------------------------------- the exporter ---
@@ -439,6 +553,10 @@ else
 fi
 
 say "installing monitoring client '$NAME' -> $TUNNEL_USER@$SERVER:$PORT"
+say "detected: $DISTRO ($PKG_MGR)"
+if [ "$DISTRO" = "unknown" ]; then
+  warn "unrecognised distribution; install packages manually and re-run with --skip-packages"
+fi
 if [ "$DRY_RUN" -eq 1 ]; then
   say "DRY RUN — nothing will be changed"
 fi
