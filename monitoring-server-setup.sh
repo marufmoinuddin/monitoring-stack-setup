@@ -396,7 +396,10 @@ Match User monitor
     PermitTunnel no
     ClientAliveInterval 15
     ClientAliveCountMax 3
-    ForceCommand /usr/sbin/nologin
+    # Enrolment only. A plain reverse tunnel uses `ssh -N` and never opens a
+    # session channel, so sshd does not run this for it; only the enrolment
+    # request reaches it. If you set nologin instead, self-enrolment is refused.
+    ForceCommand /usr/local/libexec/monitoring-forcecommand.sh
 EOF
 
 echo "  --- proposed $SSHD_DROPIN ---"
@@ -820,6 +823,20 @@ sh_run "chmod 644 '$PROJECT/prometheus/prometheus.yml' '$PROJECT/prometheus/rule
 	else
 	  c_warn "install.sh not found next to this script; the panel will not serve it"
 	fi
+
+# ---- publish the admin panel's ForceCommand helper
+# The sshd drop-in above points ForceCommand here. Without this file the
+# account would be unable to open a session channel at all, which is exactly
+# what breaks self-enrolment.
+INSTALL_FORCE="/usr/local/libexec/monitoring-forcecommand.sh"
+sh_run "install -d -m 755 /usr/local/libexec"
+if [ -f "$SCRIPT_DIR/ssh-forcecommand.sh" ]; then
+  sh_run "install -m 755 '$SCRIPT_DIR/ssh-forcecommand.sh' '$INSTALL_FORCE'"
+  c_ok "ForceCommand helper installed at $INSTALL_FORCE"
+else
+  c_warn "ssh-forcecommand.sh not found next to this script — self-enrolment will not work"
+  c_note "  copy it manually to $INSTALL_FORCE"
+fi
 
 # ---- .env (generate the password, never hardcode one)
 if [ "$DRY_RUN" -eq 1 ]; then
