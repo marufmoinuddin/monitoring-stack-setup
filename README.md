@@ -69,6 +69,7 @@ open. Nothing listens on the internet except nginx on 80/443.
 | `install.sh` | The client installer. POSIX `sh`, ~420 lines, prints every step. |
 | `admin/` | The admin panel. Standard-library-only Go, no dependencies. |
 | `monitoring-admin.service` | systemd unit for the panel. |
+| `monitor-admin.conf` | nginx vhost that publishes the panel. |
 | `monitoring-server-setup.sh` | Server setup, Docker Compose mode. |
 | `monitoring-server-setup-native.sh` | Server setup, native systemd mode. |
 | `monitoring-client-setup.sh` | Bundle-based client setup (the older path). |
@@ -102,24 +103,50 @@ touch no web server at all — Grafana stays on loopback and you reach it with
 make check          # vet + build + a live 9-assertion smoke test
 sudo make install   # /usr/local/bin/monitoring-admin
 sudo install -m 644 monitoring-admin.service /etc/systemd/system/
+sudo install -m 644 monitor-admin.conf /etc/monitoring/   # nginx vhost
 sudo useradd -r -s /usr/sbin/nologin monitoring-admin
 sudo install -d -o monitoring-admin -g monitoring-admin /var/lib/monitoring-admin
-sudo install -d -m 700 /etc/monitoring
+sudo install -d -m 755 /usr/local/share/monitoring
+sudo install -m 644 install.sh /usr/local/share/monitoring/install.sh
+```
+
+Configure it. Note the listen address:
+
+```bash
 sudo tee /etc/monitoring/admin.env >/dev/null <<EOF
-MON_LISTEN=127.0.0.1:8099
+# The bridge gateway, NOT 127.0.0.1 — a container's loopback is itself, so
+# nginx cannot reach a host service bound to loopback. Find yours with:
+#   docker network inspect proxy_net --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}'
+MON_LISTEN=172.18.0.1:8099
 MON_DOMAIN=monitor.example.com
 MON_TUNNEL_HOST=127.0.0.1
 MON_PROMETHEUS_URL=http://127.0.0.1:9090
-MON_PROXY_PUBKEY=$(cat /path/to/proxy/id_ed25519.pub)
-MON_REPO_DIR=$(pwd)
+MON_PROXY_PUBKEY=<contents of the proxy's id_ed25519.pub>
+MON_REPO_DIR=/usr/local/share/monitoring
 EOF
 sudo chmod 600 /etc/monitoring/admin.env
 sudo systemctl enable --now monitoring-admin
 ```
 
-Publish it through nginx on its own subdomain, or simply forward the port with
-`ssh -L 8099:127.0.0.1:8099 <server>` — the panel is an internal tool and needs
-no public URL.
+Then publish it. With nginx running as a container (the common case) add
+`monitor-admin.conf` to the proxy's `conf.d/`, substituting your gateway IP for
+`GATEWAY_IP`:
+
+```bash
+sed 's/GATEWAY_IP/172.18.0.1/' monitor-admin.conf \
+  > ~/docker/nginx/config/nginx/conf.d/monitor-admin.conf
+docker exec nginx_proxy nginx -t && docker exec nginx_proxy nginx -s reload
+```
+
+The panel is then at `https://monitor-admin.<domain>`. Port 8099 is **not**
+opened in the firewall and is not reachable from the internet — the gateway
+address is internal, so nginx on 443 is the only way in.
+
+If you would rather not expose it at all, skip the vhost and reach it over SSH:
+
+```bash
+ssh -L 8099:172.18.0.1:8099 <server>     # then browse http://127.0.0.1:8099
+```
 
 ### 3. Add a client
 
@@ -243,6 +270,11 @@ Each was hit for real while building this:
    runs as the right account. Without this the unit silently cannot authenticate.
 10. **`curl -f` aborts on the 4xx you are asserting.** Use plain `curl -sS` for
     negative tests, or the assertion passes for the wrong reason.
+11. **A host service on `127.0.0.1` is invisible to a containerised nginx.** A
+    container's loopback is itself, so the panel must bind the bridge gateway
+    (`docker network inspect proxy_net --format
+    '{{range .IPAM.Config}}{{.Gateway}}{{end}}'`). That address is not routable
+    from outside, so nothing is newly exposed.
 
 ## Verified end to end
 

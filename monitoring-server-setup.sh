@@ -45,6 +45,8 @@ SUDO=""
 #   none   - no web server at all; Grafana stays on loopback, reach it with
 #            an SSH tunnel. Nothing is exposed, which is the safest default.
 WEB_MODE="${WEB_MODE:-nginx}"
+ADMIN_HOST="${ADMIN_HOST:-monitor-admin}"
+ADMIN_PORT="${ADMIN_PORT:-8099}"
 NO_ADMIN=0
 ADMIN_URL="${ADMIN_URL:-}"
 
@@ -728,6 +730,69 @@ server {
     return 301 https://\$host\$request_uri;
 }
 EOF
+
+  # ---- admin panel vhost
+  # Published only when the panel is installed. The panel must listen on the
+  # Docker bridge gateway: a container's 127.0.0.1 is itself, so nginx cannot
+  # reach a host service bound to loopback.
+  if [ "$NO_ADMIN" -eq 1 ]; then
+    c_note "no admin vhost (--no-admin)"
+  else
+    PROXY_GW="$(docker network inspect "$PROXY_NET" --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null || echo '172.18.0.1')"
+    cat > "$STAGE/proj/monitor-admin.conf" <<EOF
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name $ADMIN_HOST.$DOMAIN;
+
+    ssl_certificate     /etc/nginx/certs/wildcard.crt;
+    ssl_certificate_key /etc/nginx/certs/wildcard.key;
+
+    # The panel mints SSH keys and reports device inventory.
+    add_header X-Frame-Options        "DENY"        always;
+    add_header X-Content-Type-Options "nosniff"     always;
+    add_header Referrer-Policy        "no-referrer" always;
+
+    limit_req  zone=auth burst=20 nodelay;
+    limit_conn conn_per_ip 10;
+
+    # See the note above: gateway, not loopback. No firewall rule exists for
+    # it, so the only way in is nginx on 443.
+    resolver 127.0.0.11 valid=10s ipv6=off;
+    set \$upstream http://$PROXY_GW:$ADMIN_PORT;
+
+    # Never cache live device state or one-shot install commands.
+    add_header Cache-Control "no-store" always;
+
+    location = /healthz {
+        proxy_pass \$upstream;
+        proxy_set_header Host \$host;
+        access_log off;
+    }
+
+    location / {
+        if (\$bad_bot) { return 403; }
+
+        proxy_pass \$upstream;
+        proxy_set_header Host              \$host;
+        proxy_set_header X-Real-IP         \$remote_addr;
+        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_read_timeout 60s;
+    }
+}
+
+server {
+    listen 80;
+    server_name $ADMIN_HOST.$DOMAIN;
+    return 301 https://\$host\$request_uri;
+}
+EOF
+    c_ok "staged admin vhost for $ADMIN_HOST.$DOMAIN -> $PROXY_GW:$ADMIN_PORT"
+  fi
 fi  # end --web none vhost guard
 
 if [ "$WEB_MODE" = "nginx" ]; then
@@ -845,6 +910,11 @@ if [ "$WEB_MODE" = "none" ]; then
 else
   c_step "Publish through nginx ($([ "$NGINX_IS_CONTAINER" -eq 1 ] && echo container || echo native))"
   sh_run "cp '$STAGE/proj/grafana.conf' '$NGINX_CONF_DIR/${GRAFANA_HOST}.conf'"
+  # The admin vhost is published alongside Grafana's, in the same test-then-
+  # reload step below, so a bad config can never leave both down.
+  if [ "$NO_ADMIN" -eq 0 ] && [ -f "$STAGE/proj/monitor-admin.conf" ]; then
+    sh_run "cp '$STAGE/proj/monitor-admin.conf' '$NGINX_CONF_DIR/${ADMIN_HOST}.conf'"
+  fi
   if [ "$DRY_RUN" -eq 0 ]; then
     if [ "$NGINX_IS_CONTAINER" -eq 1 ]; then
       # test, then reload only on success
