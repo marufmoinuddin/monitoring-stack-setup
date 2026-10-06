@@ -45,6 +45,8 @@ type Config struct {
 	FirstPort     int
 	LastPort      int
 	RepoDir       string
+	TunnelUser    string
+	InstallBase   string
 }
 
 type Device struct {
@@ -80,11 +82,16 @@ func main() {
 		RepoDir:       env("MON_REPO_DIR", "/opt/monitoring-stack"),
 		FirstPort:     envInt("MON_FIRST_PORT", 2201),
 		LastPort:      envInt("MON_LAST_PORT", 2203),
+		TunnelUser:    env("MON_TUNNEL_USER", "monitor"),
 	}
-	// Default the installer URL from the domain rather than making the operator
-	// set both and get them out of sync.
+	// The installer is served by THIS panel, so the download URL must be the
+	// panel's own host. Deriving it from MON_DOMAIN is only a fallback: an
+	// operator commonly sets MON_DOMAIN to the Grafana hostname, and pointing
+	// clients at Grafana's /install.sh returns Grafana's login page HTML, which
+	// then fails to execute as a shell script.
+	cfg.InstallBase = env("MON_INSTALL_BASE", "https://monitor-admin."+cfg.Domain)
 	if cfg.InstallURL == "" {
-		cfg.InstallURL = "https://" + cfg.Domain + "/install.sh"
+		cfg.InstallURL = cfg.InstallBase + "/install.sh"
 	}
 
 	if len(os.Args) > 1 && (os.Args[1] == "-version" || os.Args[1] == "--version") {
@@ -358,10 +365,27 @@ func validName(n string) bool {
 
 // installCommand is the one-liner. It mirrors Beszel's shape: fetch a readable
 // script, then run it with the port, the proxy public key and the server URL.
+//
+// Two things here are load-bearing and both were learned the hard way:
+//
+//  1. The URL is THIS panel's own host, never Grafana. Grafana has no
+//     /install.sh and answers with a redirect to its login page.
+//  2. The download is validated before it is executed. A web page saved as
+//     install.sh cannot self-guard: its first line begins with '<', which sh
+//     parses as an input redirection and dies with "cannot open a" or
+//     "Syntax error: newline unexpected" before any code runs. So the check
+//     must happen in the command, not inside the script.
 func (s *Server) installCommand(name string, port int) string {
+	dl := s.cfg.InstallURL
 	return fmt.Sprintf(
-		"curl -fsSL %s -o /tmp/install-monitoring.sh && chmod +x /tmp/install-monitoring.sh && sudo /tmp/install-monitoring.sh --name %s --port %d --server %s --key %q",
-		s.cfg.InstallURL, name, port, s.cfg.Domain, s.cfg.ProxyPubkey,
+		"curl -fsSL %s -o /tmp/install-monitoring.sh && "+
+			"head -1 /tmp/install-monitoring.sh | grep -q '^#!' || "+
+			"{ echo \"ERROR: that URL returned a web page, not the installer.\"; "+
+			"echo \"The admin panel must be published at https://monitor-admin.<your-domain>/\"; "+
+			"head -2 /tmp/install-monitoring.sh; exit 1; }; "+
+			"chmod +x /tmp/install-monitoring.sh && "+
+			"sudo /tmp/install-monitoring.sh --name %s --port %d --user %s --server %s --key %q",
+		dl, name, port, s.cfg.TunnelUser, s.cfg.Domain, s.cfg.ProxyPubkey,
 	)
 }
 

@@ -25,6 +25,15 @@
 # =============================================================================
 set -eu
 
+# Capture our own path once, at the very top, before anything else can mangle
+# $0. The shebang guard near the end depends on being able to read this file.
+SELF="$0"
+case "$SELF" in
+  /*) : ;;
+  */*) SELF="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)/$(basename "$SELF")" || SELF="$0" ;;
+  *)   SELF="$(command -v "$SELF" 2>/dev/null || echo "$SELF")" ;;
+esac
+
 NAME=""
 PORT=""
 SERVER=""
@@ -408,6 +417,26 @@ case "$TUNNEL_USER" in
   ''|*[!a-z0-9_-]*) die "--user must be a simple account name, got '$TUNNEL_USER'" ;;
 esac
 [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "--port out of range"
+
+# Guard against being handed something that is not this installer. The usual
+# cause is a wrong URL: requesting /install.sh from a host that serves a web UI
+# returns an HTML login page, and sh then fails with a bare
+# "Syntax error: newline unexpected" and no clue why. The real installer always
+# begins with a shebang, so this check needs no opt-in flag.
+if head -1 "$SELF" 2>/dev/null | grep -q '^#!'; then
+  :
+else
+  first_line="$(head -1 "$SELF" 2>/dev/null || true)"
+  warn "this file does not start with a shebang — it is not the installer."
+  warn "first line was: ${first_line:-<empty>}"
+  warn ""
+  warn "you almost certainly downloaded a web page instead of the script."
+  warn "Check the URL: it must point at the admin panel's own host, e.g."
+  warn "  https://monitor-admin.<your-domain>/install.sh"
+  warn "and NOT at Grafana, which has no /install.sh and answers with a"
+  warn "redirect to its login page."
+  die "refusing to continue"
+fi
 
 say "installing monitoring client '$NAME' -> $TUNNEL_USER@$SERVER:$PORT"
 if [ "$DRY_RUN" -eq 1 ]; then
